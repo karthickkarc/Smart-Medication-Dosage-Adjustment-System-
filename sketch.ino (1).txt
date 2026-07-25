@@ -1,0 +1,327 @@
+#include <WiFi.h>
+#include "Adafruit_MQTT.h"
+#include "Adafruit_MQTT_Client.h"
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include "secrets.h"   // WIFI_SSID, WIFI_PASS, IO_USERNAME, IO_KEY
+
+//====================================================
+// OLED
+//====================================================
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define POT_PIN 34
+
+int mqttDose = 0;
+int potDose = 0;
+bool manualMode = false;
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  -1
+);
+
+//====================================================
+// ADAFRUIT IO / MQTT
+//====================================================
+
+#define MQTT_SERVER "io.adafruit.com"
+#define MQTT_PORT 1883
+
+WiFiClient client;
+
+Adafruit_MQTT_Client mqtt(
+  &client,
+  MQTT_SERVER,
+  MQTT_PORT,
+  IO_USERNAME,
+  IO_KEY
+);
+
+//====================================================
+// FEED
+//====================================================
+
+Adafruit_MQTT_Subscribe dosage =
+Adafruit_MQTT_Subscribe(
+  &mqtt,
+  IO_USERNAME "/feeds/dosage"
+);
+
+//====================================================
+// PINS
+//====================================================
+
+#define GREEN_LED 25
+#define YELLOW_LED 26
+#define RED_LED 27
+
+#define BUZZER 14
+
+#define BUTTON 12
+
+//====================================================
+// VARIABLES
+//====================================================
+
+int currentDose = 0;
+int targetDose = 0;
+
+String status = "NORMAL";
+
+//====================================================
+// CONNECT TO WIFI
+//====================================================
+
+void connectWiFi() {
+
+  Serial.print("Connecting to WiFi");
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  Serial.println();
+  Serial.println("WiFi Connected");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+//====================================================
+// CONNECT TO ADAFRUIT IO
+//====================================================
+
+void connectMQTT() {
+
+  if (mqtt.connected()) return;
+
+  Serial.print("Connecting to Adafruit IO... ");
+
+  int8_t ret = mqtt.connect();
+
+  if (ret == 0) {
+    Serial.println("Connected!");
+    return;
+  }
+
+  Serial.print("Failed: ");
+  Serial.println(mqtt.connectErrorString(ret));
+
+  mqtt.disconnect();
+}
+
+//====================================================
+// SETUP
+//====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(YELLOW_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+
+  pinMode(BUZZER, OUTPUT);
+
+  pinMode(BUTTON, INPUT_PULLUP);
+
+  // OLED
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+
+    Serial.println("OLED Failed");
+
+    while (1);
+
+  }
+
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.println("SMART MEDICATION");
+  display.println("SYSTEM");
+  display.println("BOOTING...");
+  display.display();
+
+  // WiFi
+
+  connectWiFi();
+
+  // Subscribe to Adafruit IO feed
+
+  mqtt.subscribe(&dosage);
+
+  // Connect MQTT
+
+  connectMQTT();
+
+  Serial.println("-----------------------------");
+  Serial.println("System Ready");
+  Serial.println("-----------------------------");
+}
+
+//====================================================
+// LOOP
+//====================================================
+
+void loop() {
+
+  // Keep MQTT Connected
+  connectMQTT();
+
+  // Read potentiometer
+  potDose = map(analogRead(POT_PIN), 0, 4095, 0, 100);
+
+  // If the potentiometer is moved significantly,
+  // switch to manual mode
+  if (abs(potDose - targetDose) > 3) {
+    manualMode = true;
+    targetDose = potDose;
+  }
+  if (digitalRead(BUTTON) == LOW) {
+
+    delay(200); // debounce
+
+    manualMode = false;
+
+    targetDose = mqttDose;
+
+    Serial.println("Returned to Dashboard Mode");
+  }
+
+  // Read incoming messages
+  Adafruit_MQTT_Subscribe *subscription;
+
+  while ((subscription = mqtt.readSubscription(10))) {
+
+    if (subscription == &dosage) {
+
+      String msg = (char *)dosage.lastread;
+
+      Serial.print("Received Dose : ");
+      Serial.println(msg);
+
+      mqttDose = msg.toInt();
+
+      if (!manualMode) {
+        targetDose = mqttDose;
+      }
+
+      Serial.print("MQTT Dose: ");
+      Serial.println(mqttDose);
+
+      Serial.print("Target Dose : ");
+      Serial.println(targetDose);
+    }
+  }
+
+  //===========================
+  // Rate Limiter
+  //===========================
+
+  if (currentDose < targetDose) {
+
+    currentDose += 2;
+
+    if (currentDose > targetDose)
+      currentDose = targetDose;
+
+  } else if (currentDose > targetDose) {
+
+    currentDose -= 2;
+
+    if (currentDose < targetDose)
+      currentDose = targetDose;
+  }
+
+  //===========================
+  // Reset Outputs
+  //===========================
+
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(YELLOW_LED, LOW);
+  digitalWrite(RED_LED, LOW);
+
+  noTone(BUZZER);
+
+  //===========================
+  // Safety Logic
+  //===========================
+
+  if (currentDose <= 60) {
+
+    status = "NORMAL";
+    digitalWrite(GREEN_LED, HIGH);
+
+  }
+  else if (currentDose <= 80) {
+
+    status = "WARNING";
+    digitalWrite(YELLOW_LED, HIGH);
+
+  }
+  else {
+
+    status = "CRITICAL";
+
+    digitalWrite(RED_LED, HIGH);
+
+    tone(BUZZER, 1000);
+
+    if (digitalRead(BUTTON) == LOW) {
+
+      status = "APPROVED";
+
+      noTone(BUZZER);
+
+      digitalWrite(RED_LED, LOW);
+    }
+  }
+
+  //===========================
+  // OLED Display
+  //===========================
+
+  display.clearDisplay();
+
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+
+  display.println("SMART MEDICATION");
+  display.println("----------------");
+
+  display.print("Mode: ");
+  if (manualMode)
+    display.println("MANUAL");
+  else
+    display.println("DASHBOARD");
+
+  display.print("Target : ");
+  display.print(targetDose);
+  display.println(" mg/hr");
+
+  display.print("Current: ");
+  display.print(currentDose);
+  display.println(" mg/hr");
+
+  display.print("Status : ");
+  display.println(status);
+
+  display.display();
+
+  delay(250);
+}
